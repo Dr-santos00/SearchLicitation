@@ -12,29 +12,7 @@ prioriza as que são **serviços** (sem necessidade de estoque) e calcula um
 | Fonte de dados | API pública `pncp.gov.br/api/consulta` | Gratuita, sem chave/cadastro |
 | Classificação | Regras por palavra-chave (Python puro) | Gratuita, sem IA paga |
 | Interface | Streamlit (framework open-source) | Gratuita |
-| Atualização automática | `streamlit-autorefresh` (open-source) | Gratuita |
-| Exportação Excel | `openpyxl` (open-source) | Gratuita |
 | Hospedagem | Streamlit Community Cloud | Gratuita (plano free) |
-
-## Funcionalidades
-
-- **Busca sem limite de profundidade:** percorre automaticamente todas as
-  páginas disponíveis no PNCP para os filtros escolhidos (há apenas um teto
-  de segurança interno contra travamentos, muito acima de qualquer volume
-  real de resultados).
-- **Foco em propostas com prazo em aberto:** consulta o endpoint do PNCP que
-  traz especificamente contratações com o **período de apresentação de
-  proposta ainda aberto** — não editais já encerrados.
-- **Atualização automática:** com o interruptor "Atualização automática"
-  ligado, o app repete a busca sozinho no intervalo escolhido (5 a 60 min),
-  usando os mesmos parâmetros da última busca manual.
-- **Notificação de mudanças:** a cada atualização (manual ou automática), o
-  GOVIA compara com o resultado anterior e destaca oportunidades **novas**
-  (🆕) e **alteradas** (✏️ — mudança de valor, situação, prazo ou score),
-  com um aviso no topo da tela e uma notificação (toast).
-- **Exportação em CSV e Excel:** os resultados podem ser baixados tanto em
-  `.csv` quanto em `.xlsx` (abre diretamente no Excel/LibreOffice/Google
-  Sheets).
 
 ---
 
@@ -139,24 +117,15 @@ seu segmento (ex.: adicionar termos técnicos específicos da sua área).
 - **Uma única UF/modalidade por chamada à API.** O PNCP não permite busca
   textual livre nem múltiplos filtros combinados numa única chamada; por
   isso o app faz várias chamadas (uma por combinação de UF × modalidade) e
-  agrega os resultados, percorrendo todas as páginas de cada combinação.
-  Para muitos estados + muitas modalidades a busca fica mais lenta — não há
-  como evitar isso sem mudar a própria API do PNCP.
+  agrega os resultados. Para muitos estados + muitas modalidades a busca
+  fica mais lenta — ajuste "Profundidade da busca" na barra lateral.
   Nota: caso a API mude parâmetros ou passe a exigir campos adicionais no
   futuro, será necessário ajustar `buscar_contratacoes_abertas()` em `app.py`
   de acordo com a documentação vigente do PNCP.
-- **Atualização automática depende da aba estar aberta.** O mecanismo usado
-  (`streamlit-autorefresh`) faz o navegador pedir uma nova execução do
-  script periodicamente — funciona muito bem enquanto alguém está com o
-  GOVIA aberto no navegador, mas **não** roda em segundo plano com a aba
-  fechada, e não envia e-mail/SMS/push. Para monitoramento 24h mesmo com o
-  app fechado, seria necessário um serviço adicional (ex.: GitHub Actions
-  agendado consultando o PNCP direto + envio por SMTP gratuito) — não
-  incluído nesta versão, pois muda a arquitetura de "app único" para
-  "app + job agendado".
-- **Sem persistência entre sessões.** O histórico de "novas/alteradas" existe
-  apenas durante a sessão do navegador aberta; ao fechar a aba, a próxima
-  visita começa do zero (sem base de comparação).
+- **Sem persistência entre sessões.** Cada busca é feita "ao vivo"; não há
+  histórico salvo nem alertas automáticos por e-mail (isso exigiria um
+  serviço de agendamento/e-mail, que tem opções gratuitas como GitHub
+  Actions + SMTP gratuito, mas não está incluído nesta versão inicial).
 - **Sem cadastro de múltiplos clientes/consultorias.** A versão atual
   atende a um único perfil de prospecção por vez.
 

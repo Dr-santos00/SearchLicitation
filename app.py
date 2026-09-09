@@ -13,14 +13,13 @@ Custo de operação: R$ 0,00
     - Hospedagem sugerida: Streamlit Community Cloud (plano gratuito)
 """
 
-import io
+import re
 import time
-from datetime import date, datetime, timedelta
+from datetime import date, timedelta
 
 import pandas as pd
 import requests
 import streamlit as st
-from streamlit_autorefresh import st_autorefresh
 
 # --------------------------------------------------------------------------
 # CONFIGURAÇÃO GERAL
@@ -35,19 +34,8 @@ st.set_page_config(
 BASE_URL = "https://pncp.gov.br/api/consulta"
 PORTAL_EDITAL_URL = "https://pncp.gov.br/app/editais/{cnpj}/{ano}/{sequencial}"
 
-REQUEST_TIMEOUT = 25   # segundos por requisição HTTP
-TAMANHO_PAGINA = 500    # máximo permitido pela API — reduz nº de chamadas
-
-# "Sem limite de busca" na prática: a API do PNCP não tem busca textual nem
-# um jeito de trazer tudo de uma vez, então percorremos página a página até
-# a própria API dizer que acabou. Estes dois valores são só uma rede de
-# segurança para o app não travar (ex.: bug ou resposta inesperada da API) —
-# 300 páginas x 500 registros = até 150.000 registros por combinação de
-# UF/modalidade, um teto muito acima do que qualquer filtro real produz.
-MAX_PAGINAS_SEGURANCA = 300
-MAX_SEGUNDOS_POR_COMBINACAO = 60
-
-CACHE_TTL_SEGUNDOS = 300  # 5 minutos — resultados "frescos" para detectar mudanças
+REQUEST_TIMEOUT = 20  # segundos
+TAMANHO_PAGINA = 50   # registros por página (máx. permitido pela API: 500)
 
 # Tabela de domínio oficial (Manual de Consultas do PNCP)
 MODALIDADES = {
@@ -111,35 +99,16 @@ PALAVRAS_PRODUTO = [
 # --------------------------------------------------------------------------
 
 
-@st.cache_data(show_spinner=False, ttl=CACHE_TTL_SEGUNDOS)
+@st.cache_data(show_spinner=False, ttl=1800)
 def buscar_contratacoes_abertas(uf: str, modalidade_id: int, data_final: str,
-                                 _cache_bucket: int) -> list:
+                                 max_paginas: int) -> list:
     """
-    Consulta o endpoint público /v1/contratacoes/proposta — contratações com
-    o período de recebimento de PROPOSTA ainda em aberto (foco explícito do
-    sistema: apresentação de proposta/projeto/serviço em aberto, não editais
-    já encerrados). Gratuito, sem chave de acesso.
-
-    Percorre TODAS as páginas disponíveis (sem limite definido pelo usuário),
-    respeitando apenas uma rede de segurança interna contra travamentos
-    (MAX_PAGINAS_SEGURANCA / MAX_SEGUNDOS_POR_COMBINACAO).
-
-    _cache_bucket força a expiração do cache quando queremos dados
-    garantidamente novos (ex.: ciclo de atualização automática).
+    Consulta o endpoint público /v1/contratacoes/proposta (contratações com
+    período de recebimento de propostas em aberto). Gratuito, sem chave.
     """
     registros = []
     pagina = 1
-    inicio = time.monotonic()
-
-    while pagina <= MAX_PAGINAS_SEGURANCA:
-        if time.monotonic() - inicio > MAX_SEGUNDOS_POR_COMBINACAO:
-            st.session_state.setdefault("erros_api", []).append(
-                f"UF={uf} modalidade={modalidade_id}: busca interrompida por "
-                f"tempo limite ({MAX_SEGUNDOS_POR_COMBINACAO}s) — resultados "
-                f"parciais desta combinação foram mantidos."
-            )
-            break
-
+    while pagina <= max_paginas:
         params = {
             "dataFinal": data_final,
             "codigoModalidadeContratacao": modalidade_id,
@@ -184,25 +153,24 @@ def buscar_contratacoes_abertas(uf: str, modalidade_id: int, data_final: str,
     return registros
 
 
-def coletar_oportunidades(ufs, modalidades, dias_janela, cache_bucket=0):
-    """Varre UF x Modalidade (todas as páginas), deduplica por numeroControlePNCP."""
+def coletar_oportunidades(ufs, modalidades, dias_janela, max_paginas):
+    """Varre UF x Modalidade, deduplica por numeroControlePNCP."""
     st.session_state["erros_api"] = []
     data_final = (date.today() + timedelta(days=dias_janela)).strftime("%Y%m%d")
 
     brutos = {}
     combinacoes = [(uf, mid) for uf in ufs for mid in modalidades]
-    progresso = st.progress(0.0, text="Consultando PNCP (todas as páginas)...")
+    progresso = st.progress(0.0, text="Consultando PNCP...")
 
     for i, (uf, mid) in enumerate(combinacoes, start=1):
-        registros = buscar_contratacoes_abertas(uf, mid, data_final, cache_bucket)
+        registros = buscar_contratacoes_abertas(uf, mid, data_final, max_paginas)
         for r in registros:
             chave = r.get("numeroControlePNCP")
             if chave:
                 brutos[chave] = r
         progresso.progress(
             i / len(combinacoes),
-            text=f"Consultando PNCP... {uf} / {MODALIDADES.get(mid, mid)} "
-                 f"({len(brutos)} registros até agora)",
+            text=f"Consultando PNCP... {uf} / {MODALIDADES.get(mid, mid)}",
         )
 
     progresso.empty()
@@ -315,67 +283,6 @@ def classificar_oportunidade(item: dict, valor_min: float, valor_max: float,
     }
 
 
-def executar_busca(ufs, modalidades, dias_janela, valor_min, valor_max,
-                    prazo_min_dias, palavras_empresa, excluir_termos,
-                    origem="manual"):
-    """
-    Executa uma busca completa (todas as páginas) e compara com o resultado
-    anterior salvo em sessão para detectar oportunidades novas ou alteradas.
-    Atualiza st.session_state com os novos resultados e a notificação.
-    """
-    cache_bucket = int(time.time() // CACHE_TTL_SEGUNDOS)
-    with st.spinner(
-        "Consultando a API pública do PNCP (todas as páginas disponíveis)..."
-    ):
-        brutos = coletar_oportunidades(ufs, modalidades, dias_janela, cache_bucket)
-
-    classificadas = []
-    for item in brutos:
-        resultado = classificar_oportunidade(
-            item, valor_min, valor_max, prazo_min_dias, palavras_empresa, excluir_termos
-        )
-        if resultado:
-            classificadas.append(resultado)
-    classificadas.sort(key=lambda x: x["score"], reverse=True)
-
-    # --- Detecção de mudanças frente à busca anterior ---
-    anteriores_por_chave = {
-        r["numeroControlePNCP"]: r for r in st.session_state.get("resultados", [])
-    }
-    ja_existia_busca_anterior = bool(anteriores_por_chave)
-
-    novas, alteradas = [], []
-    CAMPOS_MONITORADOS = ("valorEstimado", "situacao", "diasRestantes", "score")
-
-    for r in classificadas:
-        chave = r["numeroControlePNCP"]
-        anterior = anteriores_por_chave.get(chave)
-        if anterior is None:
-            r["status_atualizacao"] = "novo"
-            novas.append(r)
-        else:
-            mudou = any(anterior.get(c) != r.get(c) for c in CAMPOS_MONITORADOS)
-            if mudou:
-                r["status_atualizacao"] = "alterado"
-                alteradas.append(r)
-            else:
-                r["status_atualizacao"] = None
-
-    st.session_state["resultados"] = classificadas
-    st.session_state["total_bruto"] = len(brutos)
-    st.session_state["ultima_busca_em"] = datetime.now()
-    st.session_state["ultima_busca_origem"] = origem
-
-    if ja_existia_busca_anterior and (novas or alteradas):
-        msg = f"🔔 {len(novas)} nova(s) · {len(alteradas)} alterada(s) desde a última atualização"
-        st.session_state["notificacao"] = msg
-        st.toast(msg, icon="🔔")
-    elif not ja_existia_busca_anterior:
-        st.session_state["notificacao"] = None
-    else:
-        st.session_state["notificacao"] = None
-
-
 # --------------------------------------------------------------------------
 # INTERFACE
 # --------------------------------------------------------------------------
@@ -384,8 +291,7 @@ st.title("🏛️ GOVIA")
 st.caption(
     "Inteligência em contratações públicas — encontre licitações de "
     "**serviços**, sem necessidade de estoque, com base nos dados abertos "
-    "do PNCP. Busca focada em contratações com **prazo de proposta em "
-    "aberto**. 100% gratuito para operar."
+    "do PNCP. 100% gratuito para operar."
 )
 
 with st.sidebar:
@@ -429,48 +335,17 @@ with st.sidebar:
         placeholder="ex: obras, construção civil, merenda",
     )
 
-    st.caption(
-        "ℹ️ A busca percorre **todas as páginas** disponíveis no PNCP para "
-        "os filtros acima — não há limite de profundidade configurável."
-    )
-
     st.divider()
-    st.subheader("🔄 Atualização automática")
-    auto_refresh = st.toggle(
-        "Ativar atualização automática",
-        value=st.session_state.get("auto_refresh_ativo", False),
-        help="Enquanto esta aba do navegador estiver aberta, o GOVIA refaz "
-             "a busca periodicamente com os mesmos parâmetros e avisa se "
-             "algo mudou. Não funciona com a aba fechada (limitação de "
-             "hospedagem gratuita, sem serviço de background).",
-    )
-    st.session_state["auto_refresh_ativo"] = auto_refresh
-    intervalo_min = st.selectbox(
-        "Intervalo de atualização", options=[5, 10, 15, 30, 60], index=2,
-        format_func=lambda m: f"a cada {m} minutos", disabled=not auto_refresh,
+    max_paginas = st.slider(
+        "Profundidade da busca (páginas por UF/modalidade)", 1, 20, 5,
+        help="Cada página traz até 50 registros. Valores maiores = busca mais completa e mais lenta.",
     )
 
     buscar = st.button("🔎 Buscar oportunidades", type="primary", use_container_width=True)
 
 # --------------------------------------------------------------------------
-# GATILHO DE ATUALIZAÇÃO AUTOMÁTICA
+# EXECUÇÃO DA BUSCA
 # --------------------------------------------------------------------------
-# st_autorefresh força o Streamlit a "re-rodar" o script periodicamente
-# enquanto a aba estiver aberta — é o mecanismo que permite atualização
-# automática sem custo, mas só funciona com a página aberta no navegador.
-
-if auto_refresh:
-    st_autorefresh(interval=intervalo_min * 60 * 1000, key="ciclo_auto_refresh")
-
-parametros_atuais = dict(
-    ufs=ufs_selecionadas, modalidades=modalidades_selecionadas,
-    dias_janela=dias_janela, valor_min=valor_min, valor_max=valor_max,
-    prazo_min_dias=prazo_min_dias, perfil_empresa=perfil_empresa,
-    excluir_texto=excluir_texto,
-)
-
-deve_buscar = False
-origem_busca = "manual"
 
 if buscar:
     if not ufs_selecionadas:
@@ -479,37 +354,26 @@ if buscar:
     if not modalidades_selecionadas:
         st.warning("Selecione ao menos uma modalidade.")
         st.stop()
-    deve_buscar = True
-    origem_busca = "manual"
-    st.session_state["parametros_busca"] = parametros_atuais
 
-elif (
-    auto_refresh
-    and "resultados" in st.session_state
-    and st.session_state.get("parametros_busca") == parametros_atuais
-    and st.session_state.get("ultima_busca_em")
-    and (datetime.now() - st.session_state["ultima_busca_em"]).total_seconds()
-        >= intervalo_min * 60
-):
-    # Ciclo automático: só dispara com os MESMOS parâmetros da última busca
-    # manual, evitando buscar sozinho um perfil que o usuário ainda nem
-    # confirmou.
-    deve_buscar = True
-    origem_busca = "automática"
+    with st.spinner("Consultando a API pública do PNCP..."):
+        brutos = coletar_oportunidades(
+            ufs_selecionadas, modalidades_selecionadas, dias_janela, max_paginas
+        )
 
-# --------------------------------------------------------------------------
-# EXECUÇÃO DA BUSCA
-# --------------------------------------------------------------------------
-
-if deve_buscar:
     palavras_empresa = [p.strip() for p in perfil_empresa.split(",") if p.strip()]
     excluir_termos = [p.strip() for p in excluir_texto.split(",") if p.strip()]
 
-    executar_busca(
-        ufs_selecionadas, modalidades_selecionadas, dias_janela,
-        valor_min, valor_max, prazo_min_dias, palavras_empresa,
-        excluir_termos, origem=origem_busca,
-    )
+    classificadas = []
+    for item in brutos:
+        resultado = classificar_oportunidade(
+            item, valor_min, valor_max, prazo_min_dias, palavras_empresa, excluir_termos
+        )
+        if resultado:
+            classificadas.append(resultado)
+
+    classificadas.sort(key=lambda x: x["score"], reverse=True)
+    st.session_state["resultados"] = classificadas
+    st.session_state["total_bruto"] = len(brutos)
 
 # --------------------------------------------------------------------------
 # EXIBIÇÃO DOS RESULTADOS
@@ -518,28 +382,6 @@ if deve_buscar:
 if "resultados" in st.session_state:
     resultados = st.session_state["resultados"]
     total_bruto = st.session_state.get("total_bruto", len(resultados))
-    ultima_busca_em = st.session_state.get("ultima_busca_em")
-    ultima_busca_origem = st.session_state.get("ultima_busca_origem", "manual")
-
-    status_cols = st.columns([3, 2])
-    with status_cols[0]:
-        if ultima_busca_em:
-            origem_label = "🔄 automática" if ultima_busca_origem == "automática" else "🖱️ manual"
-            st.caption(
-                f"Última atualização: {ultima_busca_em.strftime('%d/%m/%Y %H:%M:%S')} ({origem_label})"
-            )
-    with status_cols[1]:
-        if auto_refresh:
-            proximo = ""
-            if ultima_busca_em:
-                segundos_restantes = max(
-                    0, intervalo_min * 60 - (datetime.now() - ultima_busca_em).total_seconds()
-                )
-                proximo = f" · próxima em ~{int(segundos_restantes // 60)} min"
-            st.caption(f"🔄 Atualização automática ativa (a cada {intervalo_min} min){proximo}")
-
-    if st.session_state.get("notificacao"):
-        st.success(st.session_state["notificacao"])
 
     if st.session_state.get("erros_api"):
         with st.expander(f"⚠️ {len(st.session_state['erros_api'])} avisos durante a consulta"):
@@ -549,60 +391,31 @@ if "resultados" in st.session_state:
     alta = sum(1 for r in resultados if r["prioridade"].startswith("🟢"))
     media = sum(1 for r in resultados if r["prioridade"].startswith("🟡"))
     baixa = sum(1 for r in resultados if r["prioridade"].startswith("🔴"))
-    novas_qtd = sum(1 for r in resultados if r.get("status_atualizacao") == "novo")
-    alteradas_qtd = sum(1 for r in resultados if r.get("status_atualizacao") == "alterado")
 
     st.subheader(f"{len(resultados)} oportunidades encontradas (de {total_bruto} localizadas no PNCP)")
-    c1, c2, c3, c4 = st.columns(4)
+    c1, c2, c3 = st.columns(3)
     c1.metric("🟢 Alta prioridade", alta)
     c2.metric("🟡 Média prioridade", media)
     c3.metric("🔴 Baixa prioridade", baixa)
-    c4.metric("🔔 Novas/alteradas", novas_qtd + alteradas_qtd)
 
-    filtro_col1, filtro_col2 = st.columns([3, 2])
-    with filtro_col1:
-        filtro_prioridade = st.radio(
-            "Filtrar por prioridade", ["Todas", "🟢 Alta", "🟡 Média", "🔴 Baixa"],
-            horizontal=True,
-        )
-    with filtro_col2:
-        somente_novidades = st.checkbox(
-            "Mostrar apenas novas/alteradas", value=False,
-            disabled=(novas_qtd + alteradas_qtd) == 0,
-        )
-
-    exibir = resultados
+    filtro_prioridade = st.radio(
+        "Filtrar por prioridade", ["Todas", "🟢 Alta", "🟡 Média", "🔴 Baixa"],
+        horizontal=True,
+    )
     if filtro_prioridade != "Todas":
-        exibir = [r for r in exibir if r["prioridade"] == filtro_prioridade]
-    if somente_novidades:
-        exibir = [r for r in exibir if r.get("status_atualizacao")]
+        exibir = [r for r in resultados if r["prioridade"] == filtro_prioridade]
+    else:
+        exibir = resultados
 
-    # --- Exportação: CSV e Excel ---
+    # Exportação
     if exibir:
-        df_export = pd.DataFrame(exibir).drop(columns=["status_atualizacao"], errors="ignore")
-
-        buffer_excel = io.BytesIO()
-        with pd.ExcelWriter(buffer_excel, engine="openpyxl") as writer:
-            df_export.to_excel(writer, index=False, sheet_name="Oportunidades")
-        buffer_excel.seek(0)
-
-        exp_col1, exp_col2 = st.columns(2)
-        with exp_col1:
-            st.download_button(
-                "⬇️ Exportar resultados (CSV)",
-                data=df_export.to_csv(index=False).encode("utf-8-sig"),
-                file_name="govia_oportunidades.csv",
-                mime="text/csv",
-                use_container_width=True,
-            )
-        with exp_col2:
-            st.download_button(
-                "⬇️ Exportar resultados (Excel)",
-                data=buffer_excel,
-                file_name="govia_oportunidades.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True,
-            )
+        df_export = pd.DataFrame(exibir)
+        st.download_button(
+            "⬇️ Exportar resultados (CSV)",
+            data=df_export.to_csv(index=False).encode("utf-8-sig"),
+            file_name="govia_oportunidades.csv",
+            mime="text/csv",
+        )
 
     st.divider()
 
@@ -610,12 +423,7 @@ if "resultados" in st.session_state:
         with st.container(border=True):
             col_a, col_b = st.columns([5, 1])
             with col_a:
-                badge = ""
-                if r.get("status_atualizacao") == "novo":
-                    badge = " 🆕 **NOVO**"
-                elif r.get("status_atualizacao") == "alterado":
-                    badge = " ✏️ **ATUALIZADO**"
-                st.markdown(f"**{r['orgao']}** — {r['municipio']}/{r['uf']}{badge}")
+                st.markdown(f"**{r['orgao']}** — {r['municipio']}/{r['uf']}")
                 st.write(r["objeto"] or "_(sem descrição)_")
             with col_b:
                 st.markdown(f"### {r['score']}/100")
@@ -629,7 +437,7 @@ if "resultados" in st.session_state:
             m1.metric("Valor estimado", valor_fmt)
             m2.metric("Modalidade", r["modalidade"])
             m3.metric(
-                "Prazo p/ proposta",
+                "Prazo",
                 f"{r['diasRestantes']} dia(s)" if r["diasRestantes"] is not None else "—",
             )
             m4.metric("Situação", r["situacao"])
@@ -663,27 +471,5 @@ combinando:
 As listas de palavras-chave (`PALAVRAS_SERVICO` / `PALAVRAS_PRODUTO`) ficam
 no início do arquivo `app.py` e podem ser editadas livremente para o seu
 segmento de atuação.
-        """
-    )
-
-with st.expander("Sobre a atualização automática e as notificações"):
-    st.markdown(
-        """
-- A busca consulta o endpoint `/v1/contratacoes/proposta` do PNCP, que traz
-  **apenas contratações com o prazo de apresentação de proposta ainda em
-  aberto** — é o foco principal do sistema.
-- A busca percorre **todas as páginas** disponíveis para os filtros
-  escolhidos (sem limite configurável), respeitando apenas um teto de
-  segurança interno para não travar o app.
-- Com **"Atualização automática"** ativada, o GOVIA repete a busca com os
-  mesmos parâmetros no intervalo escolhido, compara com o resultado
-  anterior e destaca oportunidades **novas** (🆕) ou **alteradas** (✏️ —
-  mudança de valor, situação, prazo ou score), com um aviso no topo da tela
-  e uma notificação (toast).
-- **Limitação importante (hospedagem gratuita):** a atualização automática
-  só funciona enquanto esta aba do navegador estiver aberta. Não há um
-  processo rodando em segundo plano nem envio de e-mail/push quando a aba
-  está fechada — isso exigiria um serviço adicional (ex.: agendador +
-  e-mail), que não está incluído nesta versão gratuita.
         """
     )
